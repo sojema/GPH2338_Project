@@ -1,6 +1,6 @@
-# GPH2338_Project (Sophie Madjarova and Mykel Miller)
-
-# Predicting Death and Complications after Myocardial Infarction: A Classification Problem
+# GPH2338_Project 
+Predicting Death and Complications after Myocardial Infarction: A Classification Problem
+Mykel Miller and Sophie Madjarova
 
 For this project, we used a dataset from the UC Irvine Machine Learning Repository titled “Myocardial infarction complications.” The dataset was collected from 1992 to 1995 in the Krasnoyarsk Interdistrict Clinical Hospital, a hospital in Russia and contains 124 variables and 1700 observations. We will examine a wide range of data, including both continuous variables (such as blood pressure), and categorical variables (such as type of infarction). (UC Irvine Machine Learning Repository https://doi.org/10.24432/C53P5M)
 
