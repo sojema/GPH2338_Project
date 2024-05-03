@@ -1,0 +1,1146 @@
+---
+title: "GPH 2338 Final Project"
+subtitle: "Predicting Death and Complications after Myocardial Infarction: 
+A Classification Problem"
+author: "Mykel Miller & Sophie Madjarova"
+output: pdf_document
+date: "2024-05-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warnings = FALSE, fig.align = 'center',  eval = TRUE)
+```
+```{r message = FALSE}
+library(readxl)
+library(pROC)
+library(randomForest)
+library(dplyr)
+library(rattle)
+library(rpart)
+library(rpart.plot)
+library(RColorBrewer)
+library(tree)
+library(tidyverse)
+library(MASS)
+library(knitr)
+library(kableExtra)
+```
+### Load UC Irvine MI dataset (saved locally)
+```{r}
+#Load dataset
+heart <- read.csv("myocardial_infarction.csv")
+
+#Reformat all variables to lowercase
+names(heart) <- tolower(names(heart))
+```
+### Defining target variables
+```{r Making Targets}
+#Targets ordered by mortality w/in cohort and relative severity
+heart$target_new <- NA
+heart$target_new[which(heart$p_im_sten == 1 | heart$dressler) ] <- 1
+heart$target_new[which(heart$fibr_preds == 1 | heart$preds_tah) ] <- 2
+heart$target_new[which(heart$a_v_blok == 1 | heart$jelud_tah == 1 | 
+                         heart$fibr_jelud == 1 | heart$zsn == 1) ] <- 3
+heart$target_new[which(heart$otek_lanc == 1 | heart$rec_im == 1) ] <- 4
+heart$target_new[which(heart$razriv == 1)] <- 5
+
+#Create outcome label variable for Death
+heart$death <- ifelse(heart$let_is != 0, "Dead", "Alive")
+```
+### Factoring Variables
+```{r Factoring Variables}
+#List of ordinal and binary predictors
+stattype <- read_excel("MI Stat type.xlsx")
+
+
+#Function to factor binary
+bfactor <-function(x) {
+  factor(x, levels = c(0,1))
+}
+
+#Function to factor ordinal
+ofactor <-function(x) {
+  factor(x,ordered=T)
+}
+
+#Making vectors to input into lapply and for loop
+binary <- stattype$Binary
+ordinal <- stattype$Ordinal
+
+#Factors the binary variables
+heart[binary] <- lapply(heart[binary],bfactor)
+
+# Convert ordinal variables to factors
+for (col in ordinal) {
+  if (col %in% names(heart)) {
+    heart[[col]] <- ofactor(heart[[col]])
+  }
+}
+
+#Factor target
+heart$target_new <- factor(heart$target_new)
+
+#Factor death
+heart$death <- factor(heart$death)
+
+#Name levels for first ECG variables
+qrs_levels <- function(data, ecg_var){
+  levels(data[[ecg_var]]) <- c("No infarct at this location", "Normal QRS", 
+                               "QR-complex", "Qr-complex", "QS-complex")
+  return(data)
+}
+
+heart <- qrs_levels(heart, "ant_im")
+heart <- qrs_levels(heart, "lat_im")
+heart <- qrs_levels(heart, "inf_im")
+heart <- qrs_levels(heart, "post_im")
+```
+### Separate data into train and test
+```{r}
+heart<-subset(heart, select = -c(id,fibr_preds,preds_tah,jelud_tah,
+                               fibr_jelud,a_v_blok,otek_lanc,
+                               razriv,dressler,zsn,
+                               kfk_blood,ibs_nasl,
+                               s_ad_kbrig,d_ad_kbrig,stenok_an, p_im_sten, rec_im, let_is))
+
+n <- nrow(heart)
+train_proportion <- 0.6
+n_train <- round(n * train_proportion)
+set.seed(0)
+random_indices <- sample(n)
+heart_train <- heart[random_indices[1:n_train], ]
+heart_test <- heart[random_indices[(n_train + 1):n], ]
+```
+
+### Death ECG Classification tree
+#### Try to optimize Death ECG Classification Tree by cp
+```{r eval = FALSE, include = FALSE}
+# cp_models <- list()
+# cp_vals <- seq(0.001, 3, by = 0.001)
+# 
+#  for (i in seq_along(cp_vals)) {
+#    class_tree_cp_loop <- rpart(death ~ ant_im + lat_im + inf_im + post_im + im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 + n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 + n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, data = heart_train, method = "class", control = rpart.control(minsplit = 10, xval = 50, cp = i))
+#    cp_models[[i]] <- class_tree_cp_loop
+# }
+# # Compute training classification error w loop
+# train_errors <- numeric(length(cp_models))
+# test_errors <- numeric(length(cp_models))
+# 
+# for (i in seq_along(cp_models)) {
+#    pred_train_type <- predict(cp_models[[i]], newdata = heart_train, type = "class")
+#    train_errors[i] <- mean(pred_train_type != heart_train$death)
+#    pred_test_type <- predict(cp_models[[i]], newdata = heart_test, type = "class")
+#    test_errors[i] <- mean(pred_test_type != heart_test$death)
+# }
+# 
+# #Create a data frame for plotting
+# error_df <- data.frame(
+#    i = seq_along(cp_models),
+#    train_error = train_errors,
+#    test_error = test_errors
+# )
+# 
+# # Plotting with ggplot, as we can see, tree is not sensitive to cp
+# ggplot(error_df, aes(x = cp_vals[i])) +
+#    geom_line(aes(y = train_error, color = "Train Error")) +
+#    geom_point(aes(y = train_error, color = "Train Error")) +
+#    geom_line(aes(y = test_error, color = "Test Error")) +
+#    geom_point(aes(y = test_error, color = "Test Error")) +
+#   scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+#    labs(x = "Complexity Parameter", y = "Error Rate", title = "Train and Test Errors vs. Complexity Parameter")
+```
+#### Try to optimize Death ECG Classification Tree by minsplit value
+```{r}
+minsplit_models <- list()
+minsplit_vals <- seq(1, 200, by = 1)
+
+ for (i in seq_along(minsplit_vals)) {
+   class_tree_cp_loop <- rpart(death ~ ant_im + lat_im + inf_im + post_im + im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 + n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 + n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, data = heart_train, method = "class", control = rpart.control(minsplit = i, xval = 50, cp = 0.01))
+   minsplit_models[[i]] <- class_tree_cp_loop
+}
+# Compute training classification error w loop
+train_errorsb <- numeric(length(minsplit_models))
+test_errorsb <- numeric(length(minsplit_models))
+
+for (i in seq_along(minsplit_models)) {
+   pred_train_type <- predict(minsplit_models[[i]], newdata = heart_train, type = "class")
+   train_errorsb[i] <- mean(pred_train_type != heart_train$death)
+   pred_test_type <- predict(minsplit_models[[i]], newdata = heart_test, type = "class")
+   test_errorsb[i] <- mean(pred_test_type != heart_test$death)
+}
+
+#Create a data frame for plotting
+error_dfb <- data.frame(
+   i = seq_along(minsplit_vals),
+   train_error = train_errorsb,
+   test_error = test_errorsb
+)
+
+# Plotting with ggplot, as we can see, tree is not sensitive to cp
+ggplot(error_dfb, aes(x = minsplit_vals[i])) +
+   geom_line(aes(y = train_error, color = "Train Error")) +
+   geom_point(aes(y = train_error, color = "Train Error")) +
+   geom_line(aes(y = test_error, color = "Test Error")) +
+   geom_point(aes(y = test_error, color = "Test Error")) +
+  scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+   labs(x = "Minsplit Value", y = "Error Rate", title = "Train and Test Errors vs. Minsplit Value")
+```
+#### Death ECG Classification Tree looks best at small min split, let's go with 25
+```{r}
+class_tree_death_ecg <- rpart(death ~ ant_im + lat_im + inf_im + post_im + 
+    im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 + 
+    n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 + 
+    n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 + 
+    n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 + 
+    n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, 
+    data = heart_train, method = "class", 
+    control = rpart.control(minsplit = 25, xval = 50, cp = 0.01))
+rpart.plot(class_tree_death_ecg, type = 2, extra = 101)
+#rpart.rules(class_tree, extra = 4, cover = TRUE)
+
+pred_train_type <- predict(class_tree_death_ecg, newdata = heart_train,
+                           type = "class")
+train_class_error <- mean(pred_train_type != heart_train$death)
+ 
+#Compute testing classification error
+pred_test_type <- predict(class_tree_death_ecg, newdata = heart_test, 
+                          type = "class")
+test_class_error <- mean(pred_test_type != heart_test$death)
+
+#Print in a nice table
+class_errors_df <- data.frame(
+  Model = c("Classification Tree for Death with ECG variables"),
+  Training_classification_error = train_class_error,
+  Testing_classification_error = test_class_error
+)
+print(class_errors_df)
+```
+#### ROC and AUC of Death ECG Classification (CV = 50)
+```{r}
+ecgpredcvroc.death<-roc(heart_test$death,as.numeric(pred_test_type))
+ecgpredcvauc.death<-auc(ecgpredcvroc.death)
+ecgpredcvroc.death
+ecgpredcvauc.death
+```
+#### Graphical representation of the relative variable importance in Death ECG Classification (CV = 50)
+```{r}
+#Graph of variable importance
+class_tree_ecg_death_df3 <- data.frame(
+  importance = class_tree_death_ecg$variable.importance)
+class_tree_ecg_death_long3 <- class_tree_ecg_death_df3 %>% 
+  tibble::rownames_to_column() %>% 
+  dplyr::rename("variable" = rowname) %>% 
+  dplyr::arrange(importance) %>%
+  dplyr::mutate(variable = forcats::fct_inorder(variable))
+ggplot2::ggplot(class_tree_ecg_death_long3) +
+  geom_col(aes(x = variable, y = importance),
+           col = "black", show.legend = F) +
+  coord_flip() +
+  scale_fill_grey() +
+  theme_bw()
+```
+### Target_new ECG Classification tree
+#### Try to optimize Target_new ECG Classification Tree by cp
+```{r eval = FALSE, include = FALSE}
+# cp_models <- list()
+# cp_vals <- seq(0.001, 3, by = 0.001)
+# 
+# heart_train <- heart_train[complete.cases(heart_train$target_new), ]
+# heart_test <- heart_test[complete.cases(heart_test$target_new), ]
+# 
+#  for (i in seq_along(cp_vals)) {
+#    class_tree_cp_loop <- rpart(target_new ~ ant_im + lat_im + inf_im + post_im + im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 + n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 + n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, data = heart_train, method = "class", control = rpart.control(minsplit = 10, xval = 50, cp = i))
+#    cp_models[[i]] <- class_tree_cp_loop
+# }
+# # Compute training classification error w loop
+# train_errors <- numeric(length(cp_models))
+# test_errors <- numeric(length(cp_models))
+# 
+# for (i in seq_along(cp_models)) {
+#    pred_train_type <- predict(cp_models[[i]], newdata = heart_train, type = "class")
+#    train_errors[i] <- mean(pred_train_type != heart_train$target_new)
+#    pred_test_type <- predict(cp_models[[i]], newdata = heart_test, type = "class")
+#    test_errors[i] <- mean(pred_test_type != heart_test$target_new)
+# }
+# 
+# #Create a data frame for plotting
+# error_df <- data.frame(
+#    i = seq_along(cp_models),
+#    train_error = train_errors,
+#    test_error = test_errors
+# )
+# 
+# # Plotting with ggplot, as we can see, tree is not sensitive to cp
+# ggplot(error_df, aes(x = cp_vals[i])) +
+#    geom_line(aes(y = train_error, color = "Train Error")) +
+#    geom_point(aes(y = train_error, color = "Train Error")) +
+#    geom_line(aes(y = test_error, color = "Test Error")) +
+#    geom_point(aes(y = test_error, color = "Test Error")) +
+#   scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+#    labs(x = "Complexity Parameter", y = "Error Rate", title = "Train and Test Errors vs. Complexity Parameter")
+```
+#### Try to optimize Target_new ECG Classification Tree by minsplit value
+```{r}
+heart_train <- heart_train[complete.cases(heart_train$target_new), ]
+heart_test <- heart_test[complete.cases(heart_test$target_new), ]
+
+minsplit_models <- list()
+minsplit_vals <- seq(1, 200, by = 1)
+
+ for (i in seq_along(minsplit_vals)) {
+   class_tree_cp_loop <- rpart(target_new ~ ant_im + lat_im + inf_im + post_im 
+        + im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08
+        + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 
+        + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 
+        + n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 
+        + n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, 
+        data = heart_train, method = "class", 
+        control = rpart.control(minsplit = i, xval = 50, cp = 0.01))
+   minsplit_models[[i]] <- class_tree_cp_loop
+}
+# Compute training classification error w loop
+train_errorsb <- numeric(length(minsplit_models))
+test_errorsb <- numeric(length(minsplit_models))
+
+for (i in seq_along(minsplit_models)) {
+   pred_train_type <- predict(minsplit_models[[i]], newdata = heart_train, 
+                              type = "class")
+   train_errorsb[i] <- mean(pred_train_type != heart_train$target_new)
+   pred_test_type <- predict(minsplit_models[[i]], newdata = heart_test, 
+                             type = "class")
+   test_errorsb[i] <- mean(pred_test_type != heart_test$target_new)
+}
+
+#Create a data frame for plotting
+error_dfb <- data.frame(
+   i = seq_along(minsplit_vals),
+   train_error = train_errorsb,
+   test_error = test_errorsb
+)
+
+# Plotting with ggplot, as we can see, tree is not sensitive to cp
+ggplot(error_dfb, aes(x = minsplit_vals[i])) +
+   geom_line(aes(y = train_error, color = "Train Error")) +
+   geom_point(aes(y = train_error, color = "Train Error")) +
+   geom_line(aes(y = test_error, color = "Test Error")) +
+   geom_point(aes(y = test_error, color = "Test Error")) +
+  scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+   labs(x = "Minsplit Value", y = "Error Rate", 
+        title = "Train and Test Errors vs. Minsplit Value")
+```
+#### Target_new ECG Classification Tree: notice that target_new does exceptionally well when minsplit ~25
+```{r}
+class_tree3 <- rpart(target_new ~ ant_im + lat_im + inf_im + post_im + im_pg_p 
+                     + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 
+                     + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 
+                     + n_r_ecg_p_05 + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 
+                     + n_r_ecg_p_10 + n_p_ecg_p_01 + n_p_ecg_p_03 + n_p_ecg_p_04 
+                     + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 + n_p_ecg_p_08 
+                     + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, 
+                     data = heart_train, method = "class", 
+                     control = rpart.control(minsplit = 25, xval = 50, cp = 0.01))
+rpart.plot(class_tree3, type = 2, extra = 101, box.palette = "Blues")
+
+#Compute training classification error
+pred_train_type3 <- predict(class_tree3, newdata = heart_train, type = "class")
+train_class_error3 <- mean(pred_train_type3 != heart_train$target_new)
+
+#Compute testing classification error
+pred_test_type3 <- predict(class_tree3, newdata = heart_test, type = "class")
+test_class_error3 <- mean(pred_test_type3 != heart_test$target_new)
+
+#Print in a nice table
+class_errors_df3 <- data.frame(
+  Model = c("Classification Tree for Target_new with ECG variables"),
+  Training_classification_error = train_class_error3,
+  Testing_classification_error = test_class_error3
+)
+print(class_errors_df3)
+```
+#### ROC and AUC of Target_new ECG Classification (CV = 50)
+```{r}
+ecgpredcvroc.target_new<-multiclass.roc(heart_test$target_new,as.numeric(pred_test_type3))
+ecgpredcvauc.target_new<-auc(ecgpredcvroc.target_new)
+ecgpredcvroc.target_new
+ecgpredcvauc.target_new
+```
+#### Graphical representation of the relative variable importance in Target_new ECG Classification (CV = 50)
+```{r}
+#Graph of variable importance
+class_tree_ecg_target_df4 <- data.frame(
+  importance = class_tree3$variable.importance)
+class_tree_ecg_target_long4 <- class_tree_ecg_target_df4 %>% 
+  tibble::rownames_to_column() %>% 
+  dplyr::rename("variable" = rowname) %>% 
+  dplyr::arrange(importance) %>%
+  dplyr::mutate(variable = forcats::fct_inorder(variable))
+ggplot2::ggplot(class_tree_ecg_target_long4) +
+  geom_col(aes(x = variable, y = importance),
+           col = "black", show.legend = F) +
+  coord_flip() +
+  scale_fill_grey() +
+  theme_bw()
+```
+### Make new smaller train test groups with only complete variables
+```{r}
+heart$na_kb[is.na(heart$na_kb)] <- 0
+heart$not_na_kb[is.na(heart$not_na_kb)] <- 0
+heart$lid_kb[is.na(heart$lid_kb)] <- 0
+
+#only use observations that are complete
+heart <- heart[complete.cases(heart), ]
+
+n <- nrow(heart)
+ratio<-0.6
+tr_ind<-sample(1:n,n*ratio)
+tr_data<-heart[tr_ind,]
+te_data<-heart[-tr_ind,]
+```
+### Full Death Classification Tree (CV = 50)
+#### Try to optimize full death Classification Tree (CV = 50) by cp
+```{r eval = FALSE, include = FALSE}
+# tr_data1 <- subset(tr_data, select = -c(target_new))
+# te_data1 <- subset(te_data, select = -c(target_new))
+# 
+# cp_models <- list()
+# cp_vals <- seq(0.01, 2, by = 0.01)
+# 
+# for (i in seq_along(cp_vals)) {
+#   class_tree_cp_loop <- class_tree <- rpart(death ~ ., data = tr_data1, method = "class", control = rpart.control(minsplit = 20, xval = 50, cp = i))
+#   cp_models[[i]] <- class_tree_cp_loop
+# }
+# 
+# # Compute training classification error w loop
+# train_errors <- numeric(length(cp_models))
+# test_errors <- numeric(length(cp_models))
+# 
+# for (i in seq_along(cp_models)) {
+#   pred_train_type <- predict(cp_models[[i]], newdata = tr_data1, type = "class")
+#   train_errors[i] <- mean(pred_train_type != tr_data1$death)
+#   pred_test_type <- predict(cp_models[[i]], newdata = te_data1, type = "class")
+#   test_errors[i] <- mean(pred_test_type != te_data1$death)
+# }
+# 
+# train_errors
+# 
+# # Create a data frame for plotting
+# error_df <- data.frame(
+#   i = seq_along(cp_models),
+#   train_error = train_errors,
+#   test_error = test_errors
+# )
+# 
+# # Plotting with ggplot
+# ggplot(error_df, aes(x = cp_vals[i])) +
+#   geom_line(aes(y = train_error, color = "Train Error")) +
+#   geom_point(aes(y = train_error, color = "Train Error")) +
+#   geom_line(aes(y = test_error, color = "Test Error")) +
+#   geom_point(aes(y = test_error, color = "Test Error")) +
+#   scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+#   labs(x = "Complexity Parameter Index (i)", y = "Error Rate", title = "Train and Test Errors vs. Complexity Parameter")
+```
+#### Try to optimize full death Classification Tree (CV = 50)  by minsplit
+```{r}
+tr_data1 <- subset(tr_data, select = -c(target_new))
+te_data1 <- subset(te_data, select = -c(target_new))
+
+minsplit_models <- list()
+minsplit_vals <- seq(1, 200, by = 1)
+
+ for (i in seq_along(minsplit_vals)) {
+   class_tree_cp_loop <- rpart(death ~ ., data = tr_data1, method = "class", 
+                  control = rpart.control(minsplit = i, xval = 50, cp = 0.01))
+   minsplit_models[[i]] <- class_tree_cp_loop
+}
+# Compute training classification error w loop
+train_errorsb <- numeric(length(minsplit_models))
+test_errorsb <- numeric(length(minsplit_models))
+
+for (i in seq_along(minsplit_models)) {
+   pred_train_type <- predict(minsplit_models[[i]], newdata = tr_data1, 
+                              type = "class")
+   train_errorsb[i] <- mean(pred_train_type != tr_data1$death)
+   pred_test_type <- predict(minsplit_models[[i]], newdata = te_data1, 
+                             type = "class")
+   test_errorsb[i] <- mean(pred_test_type != te_data1$death)
+}
+
+#Create a data frame for plotting
+error_dfb <- data.frame(
+   i = seq_along(minsplit_vals),
+   train_error = train_errorsb,
+   test_error = test_errorsb
+)
+
+# Plotting with ggplot, as we can see, tree is not sensitive to cp
+ggplot(error_dfb, aes(x = minsplit_vals[i])) +
+   geom_line(aes(y = train_error, color = "Train Error")) +
+   geom_point(aes(y = train_error, color = "Train Error")) +
+   geom_line(aes(y = test_error, color = "Test Error")) +
+   geom_point(aes(y = test_error, color = "Test Error")) +
+  scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+   labs(x = "Minsplit Value", y = "Error Rate", 
+        title = "Train and Test Errors vs. Minsplit Value")
+```
+#### Full Death Classification Tree (CV = 50): Notice that death does exceptionally well when minsplit ~35
+```{r}
+class_tree4 <- rpart(death ~ ., data = tr_data1, method = "class", 
+            control = rpart.control(minsplit = 35, xval = 50, cp = 0.01))
+rpart.plot(class_tree4, type = 2, extra = 101, box.palette = "Blues")
+
+
+#Compute training classification error
+pred_train_type4 <- predict(class_tree4, newdata = tr_data1, type = "class")
+train_class_error4 <- mean(pred_train_type4 != tr_data1$death)
+
+#Compute testing classification error
+pred_test_type4 <- predict(class_tree4, newdata = te_data1, type = "class")
+test_class_error4 <- mean(pred_test_type4 != te_data1$death)
+
+#Print in a nice table
+class_errors_df4 <- data.frame(
+  Model = c("Classification Tree for Death with All variables"),
+  Training_classification_error = train_class_error4,
+  Testing_classification_error = test_class_error4
+)
+print(class_errors_df4)
+```
+#### ROC/AUC Full Death Classification Tree (CV = 50)
+```{r}
+fullcvpredroc.death<-roc(te_data1$death,as.numeric(pred_test_type4))
+fullcvpredauc.death<-auc(fullcvpredroc.death)
+fullcvpredroc.death
+fullcvpredauc.death
+```
+### Full Target_new Classification Tree (CV = 50)
+#### Try to optimize full target_new Classification Tree (CV = 50) by cp
+```{r eval = FALSE, include = FALSE}
+# tr_data2 <- subset(tr_data, select = -c(death))
+# te_data2 <- subset(te_data, select = -c(death))
+# 
+# cp_models <- list()
+# cp_vals <- seq(0.01, 2, by = 0.01)
+# 
+# for (i in seq_along(cp_vals)) {
+#   class_tree_cp_loop <- class_tree <- rpart(target_new ~ ., data = tr_data2, method = "class", control = rpart.control(minsplit = 20, xval = 50, cp = i))
+#   cp_models[[i]] <- class_tree_cp_loop
+# }
+# 
+# # Compute training classification error w loop
+# train_errors <- numeric(length(cp_models))
+# test_errors <- numeric(length(cp_models))
+# 
+# for (i in seq_along(cp_models)) {
+#   pred_train_type <- predict(cp_models[[i]], newdata = tr_data2, type = "class")
+#   train_errors[i] <- mean(pred_train_type != tr_data2$target_new)
+#   pred_test_type <- predict(cp_models[[i]], newdata = te_data2, type = "class")
+#   test_errors[i] <- mean(pred_test_type != te_data2$target_new)
+# }
+# 
+# train_errors
+# 
+# # Create a data frame for plotting
+# error_df <- data.frame(
+#   i = seq_along(cp_models),
+#   train_error = train_errors,
+#   test_error = test_errors
+# )
+# 
+# # Plotting with ggplot
+# ggplot(error_df, aes(x = cp_vals[i])) +
+#   geom_line(aes(y = train_error, color = "Train Error")) +
+#   geom_point(aes(y = train_error, color = "Train Error")) +
+#   geom_line(aes(y = test_error, color = "Test Error")) +
+#   geom_point(aes(y = test_error, color = "Test Error")) +
+#   scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+#   labs(x = "Complexity Parameter Index (i)", y = "Error Rate", title = "Train and Test Errors vs. Complexity Parameter")
+```
+#### Try to optimize full target_new Classification Tree (CV = 50) by minsplit
+```{r}
+tr_data2 <- subset(tr_data, select = -c(death))
+te_data2 <- subset(te_data, select = -c(death))
+
+minsplit_models <- list()
+minsplit_vals <- seq(1, 200, by = 1)
+
+ for (i in seq_along(minsplit_vals)) {
+   class_tree_cp_loop <- rpart(target_new ~ ., data = tr_data2, method = "class",
+              control = rpart.control(minsplit = i, xval = 50, cp = 0.01))
+   minsplit_models[[i]] <- class_tree_cp_loop
+}
+# Compute training classification error w loop
+train_errorsb <- numeric(length(minsplit_models))
+test_errorsb <- numeric(length(minsplit_models))
+
+for (i in seq_along(minsplit_models)) {
+   pred_train_type <- predict(minsplit_models[[i]], newdata = tr_data2,
+                              type = "class")
+   train_errorsb[i] <- mean(pred_train_type != tr_data2$target_new)
+   pred_test_type <- predict(minsplit_models[[i]], newdata = te_data2,
+                             type = "class")
+   test_errorsb[i] <- mean(pred_test_type != te_data2$target_new)
+}
+
+#Create a data frame for plotting
+error_dfb <- data.frame(
+   i = seq_along(minsplit_vals),
+   train_error = train_errorsb,
+   test_error = test_errorsb
+)
+
+# Plotting with ggplot, as we can see, tree is not sensitive to cp
+ggplot(error_dfb, aes(x = minsplit_vals[i])) +
+   geom_line(aes(y = train_error, color = "Train Error")) +
+   geom_point(aes(y = train_error, color = "Train Error")) +
+   geom_line(aes(y = test_error, color = "Test Error")) +
+   geom_point(aes(y = test_error, color = "Test Error")) +
+  scale_color_manual(values = c("Train Error" = "blue", "Test Error" = "red")) +
+   labs(x = "Minsplit Value", y = "Error Rate",
+        title = "Train and Test Errors vs. Minsplit Value")
+```
+#### Full Target_new Classification Tree (CV = 50): Notice that target_new does exceptionally well when minsplit ~75
+```{r}
+tr_data2 <- subset(tr_data, select = -c(death))
+te_data2 <- subset(te_data, select = -c(death))
+
+class_tree5 <- rpart(target_new ~ ., data = tr_data2, method = "class", 
+      control = rpart.control(minsplit = 75, xval = 50, cp = 0.01))
+rpart.plot(class_tree5, type = 2, extra = 101, box.palette = "Blues")
+
+
+#Compute training classification error
+pred_train_type5 <- predict(class_tree5, newdata = tr_data2, type = "class")
+train_class_error5 <- mean(pred_train_type5 != tr_data2$target_new)
+
+#Compute testing classification error
+pred_test_type5 <- predict(class_tree5, newdata = te_data2, type = "class")
+test_class_error5 <- mean(pred_test_type5 != te_data2$target_new)
+
+#Print in a nice table
+class_errors_df5 <- data.frame(
+  Model = c("Classification Tree for Target_new with All variables"),
+  Training_classification_error = train_class_error5,
+  Testing_classification_error = test_class_error5
+)
+print(class_errors_df5)
+```
+#### ROC/AUC Full Target_new Classification Tree (CV = 50)
+```{r}
+fullcvpredroc.target_new<-roc(te_data2$target_new,as.numeric(pred_test_type5))
+fullcvpredauc.target_new<-auc(fullcvpredroc.target_new)
+fullcvpredroc.target_new
+fullcvpredauc.target_new
+```
+### ECG Pred Random Forest Death
+```{r}
+set.seed(0)
+ecgpredmodel.death<-randomForest(death ~ ant_im + lat_im + inf_im + post_im 
+      + im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 
+      + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 
+      + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 
+      + n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 
+      + n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, 
+      tr_data,importance=T)
+train_yhat.rfes.ecgdeath<-predict(ecgpredmodel.death, tr_data)
+trainerror.rfes.ecgdeath<-mean(train_yhat.rfes.ecgdeath!=tr_data$death)
+test_yhat.rfes.ecgdeath<-predict(ecgpredmodel.death,te_data)
+testerror.rfes.ecgdeath<-mean(test_yhat.rfes.ecgdeath!=te_data$death)
+
+trainerror.rfes.ecgdeath
+testerror.rfes.ecgdeath
+
+class_errors_df6 <- data.frame(
+  Model = c("Random Forest for Death with ECG variables"),
+  Training_classification_error = trainerror.rfes.ecgdeath,
+  Testing_classification_error = testerror.rfes.ecgdeath
+)
+print(class_errors_df)
+```
+### ROC/AUC ECG Pred Random Forest Death
+```{r}
+ecgrfpredroc.death<-roc(te_data$death,as.numeric(test_yhat.rfes.ecgdeath))
+ecgrfpredauc.death<-auc(ecgrfpredroc.death)
+ecgrfpredroc.death
+ecgrfpredauc.death
+```
+### ECG Pred Random Forest Target_new
+```{r}
+set.seed(0)
+ecgpredmodel.target_new<-randomForest(target_new ~ ant_im + lat_im + inf_im + post_im 
+        + im_pg_p + ritm_ecg_p_01 + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 
+        + n_r_ecg_p_01 + n_r_ecg_p_02 + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 
+        + n_r_ecg_p_06 + n_r_ecg_p_08 + n_r_ecg_p_09 + n_r_ecg_p_10 + n_p_ecg_p_01 
+        + n_p_ecg_p_03 + n_p_ecg_p_04 + n_p_ecg_p_05 + n_p_ecg_p_06 + n_p_ecg_p_07 
+        + n_p_ecg_p_08 + n_p_ecg_p_09 + n_p_ecg_p_10 + n_p_ecg_p_11 + n_p_ecg_p_12, 
+        tr_data,importance=T)
+train_yhat.rfes.ecgtarget_new<-predict(ecgpredmodel.target_new, tr_data)
+trainerror.rfes.ecgtarget_new<-mean(train_yhat.rfes.ecgtarget_new!=tr_data$target_new)
+test_yhat.rfes.ecgtarget_new<-predict(ecgpredmodel.target_new,te_data)
+testerror.rfes.ecgtarget_new<-mean(test_yhat.rfes.ecgtarget_new!=te_data$target_new)
+
+trainerror.rfes.ecgtarget_new
+testerror.rfes.ecgtarget_new
+```
+### ROC/AUC ECG Pred Random Forest Target_New
+```{r}
+ecgrfpredroc.target_new<-roc(te_data$target_new,as.numeric(test_yhat.rfes.ecgtarget_new))
+ecgrfpredauc.target_new<-auc(ecgrfpredroc.target_new)
+ecgrfpredroc.target_new
+ecgrfpredauc.target_new
+```
+## Merge files!
+### Loading Data
+```{r echo = FALSE}
+#Load dataset
+heart <- read.csv("myocardial_infarction.csv")
+
+#Reformat all variables to lowercase
+names(heart) <- tolower(names(heart))
+```
+
+### Making Target and Death Labels
+```{r echo = FALSE}
+#Targets coded by order of prevalence
+heart$target <- NA
+heart$target[which(heart$preds_tah == 1)] <- 1
+heart$target[which(heart$jelud_tah == 1)] <- 2
+heart$target[which(heart$razriv == 1)] <- 3
+heart$target[which(heart$a_v_blok == 1)] <- 4
+heart$target[which(heart$fibr_jelud == 1)] <- 5
+heart$target[which(heart$dressler == 1)] <- 6
+heart$target[which(heart$p_im_sten == 1)] <- 7
+heart$target[which(heart$otek_lanc == 1)] <- 8
+heart$target[which(heart$fibr_preds == 1)] <- 9
+heart$target[which(heart$zsn == 1)] <- 10
+
+#Targets ordered by mortality w/in cohort and relative severity
+heart$target_new <- NA
+heart$target_new[which(heart$p_im_sten == 1 | heart$dressler) ] <- 1
+heart$target_new[which(heart$fibr_preds == 1 | heart$preds_tah) ] <- 2
+heart$target_new[which(heart$a_v_blok == 1 | heart$jelud_tah == 1 | 
+                         heart$fibr_jelud == 1 | heart$zsn == 1) ] <- 3
+heart$target_new[which(heart$otek_lanc == 1 | heart$rec_im == 1) ] <- 4
+heart$target_new[which(heart$razriv == 1)] <- 5
+
+#Create outcome label variable for Death
+heart$death <- ifelse(heart$let_is != 0, "Dead", "Alive")
+```
+### Factoring Variables
+```{r echo = FALSE}
+
+#list of ordinal and binary predictors
+stattype <- read_excel("MI Stat type.xlsx")
+
+
+#function to factor binary
+bfactor <-function(x) {
+  factor(x, levels = c(0,1))
+}
+
+#function to factor ordinal
+ofactor <-function(x) {
+  factor(x,ordered=T)
+}
+#making vectors to input into lapply and for loop
+binary <- stattype$Binary
+ordinal <- stattype$Ordinal
+
+#factors the binary variables
+heart[binary] <- lapply(heart[binary],bfactor)
+
+# Convert ordinal variables to factors
+for (col in ordinal) {
+  if (col %in% names(heart)) {
+    heart[[col]] <- ofactor(heart[[col]])
+  }
+}
+
+#factor target
+heart$target_new <- factor(heart$target_new
+                           )
+                      
+#Create outcome label variable for Death
+heart$death <- ifelse(heart$let_is != 0, "Dead", "Alive")
+
+#factor death
+heart$death <- factor(heart$death)
+```
+### Cleaning Dataset of extraneous predictors and NAs
+```{r echo = FALSE}
+heart<-subset(heart, select = -c(id,fibr_preds,preds_tah,jelud_tah,
+                               fibr_jelud,a_v_blok,otek_lanc,
+                               razriv,dressler,zsn,
+                               kfk_blood,ibs_nasl,
+                               s_ad_kbrig,d_ad_kbrig,stenok_an, p_im_sten, rec_im, target, let_is))
+
+# na_kb, not_na_kb and lid_kb refer to the use of a drug by the cardiology team.
+# By assuming they weren't used because it wasn't recorded, we would get access to more data points for our observations, strengthening the rest of our dataset. I previously excluded them because they had such high missing rates. So im going to make the NAs for these three 0 and remove it from the subsetting above. But if it doesn't work Ill just add it back again
+
+heart$na_kb[is.na(heart$na_kb)] <- 0
+heart$not_na_kb[is.na(heart$not_na_kb)] <- 0
+heart$lid_kb[is.na(heart$lid_kb)] <- 0
+
+#Only use observations that are complete
+heart <- heart[complete.cases(heart), ]
+```
+# Making Models
+## Training & Testing Datasets for with target inluded and death included
+```{r echo = FALSE}
+set.seed(0)
+
+heartnodeath<-subset(heart,select=-death)
+heartnotarget<-subset(heart,select=-target_new)
+#making train and test data for bagging
+n <- nrow(heart)
+ratio<-0.7
+tr_ind<-sample(1:n,n*ratio)
+
+
+target_tr_data<-heartnodeath[tr_ind,]
+target_te_data<-heartnodeath[-tr_ind,]
+
+death_tr_data<-heartnotarget[tr_ind,]
+death_te_data<-heartnotarget[-tr_ind,]
+```
+## All Pred Bag for Target
+```{r}
+#running bagging (which is just random forest with mtry=p) for all predictors
+p<-ncol(target_tr_data)-1
+
+#running into error once making model
+allpredbagmodel.target<-randomForest(target_new~.,target_tr_data,mtry=p,importance=T)
+train_yhat.bag.target<-predict(allpredbagmodel.target,target_tr_data)
+trainerror.allpred.bag.target<-mean(train_yhat.bag.target!=target_tr_data$target_new)
+test_yhat.bag.target<-predict(allpredbagmodel.target,target_te_data)
+testerror.allpred.bag.target<-mean(test_yhat.bag.target!=target_te_data$target_new)
+
+```
+## All Pred Bag for Death
+```{r}
+#running bagging (which is just random forest with mtry=p) for all predictors
+p<-ncol(death_tr_data)-1
+
+
+allpredbagmodel.death<-randomForest(death~.,death_tr_data,mtry=p,importance=T)
+train_yhat.bag.death<-predict(allpredbagmodel.death,death_tr_data)
+trainerror.allpred.bag.death<-mean(train_yhat.bag.death!=death_tr_data$death)
+test_yhat.bag.death<-predict(allpredbagmodel.death,death_te_data)
+testerror.allpred.bag.death<-mean(test_yhat.bag.death!=death_te_data$death)
+```
+# All Pred Bagging Errors Target and Death
+```{r}
+allpredbagerror<- data.frame(targettrainerror=trainerror.allpred.bag.target,
+                             targettesterror=testerror.allpred.bag.target,
+                             deathtrainerror=trainerror.allpred.bag.death,
+                             deathtesterror=testerror.allpred.bag.death)
+
+print(allpredbagerror)
+```
+### ROC/AUC All Pred Bagging Model Target
+```{r}
+allpredbagroc.target<-allpredbagroc<-multiclass.roc(target_te_data$target_new,
+                                              as.numeric(test_yhat.bag.target))
+allpredbagauc.target<-auc(allpredbagroc.target)
+allpredbagroc.target
+allpredbagauc.target
+```
+### ROC/AUC All Pred Bagging Model Death
+```{r}
+allpredbagroc.death<-allpredbagroc<-roc(death_te_data$death,
+                                              as.numeric(test_yhat.bag.death))
+allpredbagauc.death<-auc(allpredbagroc.death)
+allpredbagroc.death
+allpredbagauc.death
+```
+## All pred Random Forest Target
+```{r}
+allpredrfmodel.target<-randomForest(target_new~.,target_tr_data,importance=T)
+train_yhat.all.rf<-predict(allpredrfmodel.target,target_tr_data)
+trainerror.all.rf.target<-mean(train_yhat.all.rf!=target_tr_data$target_new)
+test_yhat.all.rf<-predict(allpredrfmodel.target,target_te_data)
+testerror.all.rf.target<-mean(test_yhat.all.rf!=target_te_data$target_new)
+```
+## All pred Random Forest Death
+```{r}
+allpredrfmodel.death<-randomForest(death~.,death_tr_data,importance=T)
+train_yhat.all.rf.death<-predict(allpredrfmodel.death,death_tr_data)
+trainerror.all.rf.death<-mean(train_yhat.all.rf.death!=death_tr_data$death)
+test_yhat.all.rf.death<-predict(allpredrfmodel.death,death_te_data)
+testerror.all.rf.death<-mean(test_yhat.all.rf.death!=death_te_data$death)
+```
+## All Pred Random Forest Error
+```{r}
+allpredrferror<- data.frame(targettrainerror=trainerror.all.rf.target,
+                             targettesterror=testerror.all.rf.target,
+                            deathtrainerror=trainerror.all.rf.death,
+                            deathtesterror=testerror.all.rf.death)
+
+print(allpredbagerror)
+```
+### ROC/AUC All Pred Random Forest Model for Target
+```{r}
+allpredrfroc.target<-multiclass.roc(target_te_data$target_new,
+                                              as.numeric(test_yhat.all.rf))
+allpredrfauc.target<-auc(allpredrfroc.target)
+allpredrfroc.target
+allpredrfauc.target
+```
+### ROC/AUC All Pred Random Forest Model for Death
+```{r}
+allpredrfroc.death<-roc(death_te_data$death,as.numeric(test_yhat.all.rf.death))
+allpredrfauc.death<-auc(allpredrfroc.death)
+allpredrfroc.death
+allpredrfauc.death
+```
+## Random Forest with Economic Selection of Predictors Target
+```{r}
+
+# Predictors for economic version include: 5 infarction predictors, age, sex, and duration of arterial hypertension
+econpredmodel.target<-randomForest(target_new~ ant_im + lat_im + inf_im +
+                              post_im + im_pg_p +age+sex+dlit_ag+
+                               ritm_ecg_p_08+zab_leg_02+inf_anam,
+                     target_tr_data,importance=T)
+train_yhat.rfes.target<-predict(econpredmodel.target,target_tr_data)
+trainerror.rfes.target<-mean(train_yhat.rfes.target!=target_tr_data$target_new)
+test_yhat.rfes.target<-predict(econpredmodel.target,target_te_data)
+testerror.rfes.target<-mean(test_yhat.rfes.target!=target_te_data$target_new)
+```
+## Random Forest with Economic Selection of Predictors Death
+```{r}
+# This includes the best ecg predictors, as well as age, sex, duration of 
+# hypertension,  history of bronchitis, and number of heart attacks in past
+ econpredmodel.death<-randomForest(death~ ant_im + lat_im + inf_im +
+                              post_im + im_pg_p +age+sex+dlit_ag+
+                                ritm_ecg_p_01+n_p_ecg_p_12+
+                                ritm_ecg_p_07+n_p_ecg_p_06+
+                                ritm_ecg_p_08+n_r_ecg_p_06+
+                               ritm_ecg_p_08+zab_leg_02+inf_anam,
+                              death_tr_data,importance=T)
+train_yhat.rfes.death<-predict(econpredmodel.death,death_tr_data)
+trainerror.rfes.death<-mean(train_yhat.rfes.death!=death_tr_data$death)
+test_yhat.rfes.death<-predict(econpredmodel.death,death_te_data)
+testerror.rfes.death<-mean(test_yhat.rfes.death!=death_te_data$death)
+```
+## Econ Selection Model Errors
+```{r}
+econprederror<- data.frame(targettrainerror=trainerror.rfes.target,
+                            targettesterror=testerror.rfes.target,
+                           deathtrainerror=trainerror.rfes.death,
+                           deathtesterror=testerror.rfes.death)
+
+print(econprederror)
+```
+## Random Forest with Economic Model ROC/AUC Target
+```{r}
+econpredroc.target<-multiclass.roc(target_te_data$target_new,
+                                        as.numeric(test_yhat.rfes.target))
+econpredauc.target<-auc(econpredroc.target)
+econpredroc.target
+econpredauc.target
+```
+## Random Forest with Economic Model ROC/AUC Death
+```{r}
+econpredroc.death1<-roc(death_te_data$death,as.numeric(test_yhat.rfes.death))
+econpredauc.death1<-auc(econpredroc.death1)
+econpredroc.death1
+econpredauc.death1
+```
+## Logistic Regression with Economic Model
+```{r}
+# This includes the best ecg predictors, as well as age, sex, duration of 
+# hypertension, history of bronchitis, and number of heart attacks in past
+econpredmodel.glm.death<-glm(death~ ant_im + lat_im + inf_im +
+                              post_im + im_pg_p +age+sex+dlit_ag+
+                                ritm_ecg_p_01+n_p_ecg_p_12+
+                                ritm_ecg_p_07+n_p_ecg_p_06+
+                                ritm_ecg_p_08+n_r_ecg_p_06+
+                               ritm_ecg_p_08+zab_leg_02+inf_anam,
+                              death_tr_data,family=binomial)
+```
+### Logistic Economic Model Death Test and Train Error
+```{r}
+#Train error
+pred_train_prob<-predict(econpredmodel.glm.death,death_tr_data,type = 'response')
+trainpred.econ.glm.death <- ifelse(pred_train_prob > 0.5,"Dead","Alive")
+trainerror.econ.glm.death <- mean(trainpred.econ.glm.death != death_tr_data$death)
+
+# Test Error
+pred_test_prob<-predict(econpredmodel.glm.death,death_te_data,type = 'response')
+testpred.econ.glm.death <- ifelse(pred_test_prob > 0.5,"Dead","Alive")
+testerror.econ.glm.death <- mean(testpred.econ.glm.death != death_te_data$death)
+```
+### Logistic Economic Model Death ROC/AUC 
+```{r}
+econpredroc.death<-roc(death_te_data$death,factor(testpred.econ.glm.death,ordered=T))
+econpredauc.death<-auc(econpredroc.death)
+econpredroc.death
+econpredauc.death
+```
+### ECG Only Logistic Model Death
+```{r}
+glmdeath<-glm(death ~ ant_im + lat_im + inf_im + post_im + im_pg_p + ritm_ecg_p_01 
+            + ritm_ecg_p_02 + ritm_ecg_p_07 + ritm_ecg_p_08 + n_r_ecg_p_01 
+            + n_r_ecg_p_03 + n_r_ecg_p_04 + n_r_ecg_p_05 + n_r_ecg_p_06  + n_p_ecg_p_03  
+            + n_p_ecg_p_06 + n_p_ecg_p_07 + n_p_ecg_p_08  + n_p_ecg_p_10 + n_p_ecg_p_11 
+            + n_p_ecg_p_12,death_tr_data,family=binomial)
+```
+### ECG Logistic Model Death Test and Train Error
+```{r}
+#Train error
+pred_train_prob <- predict(glmdeath,death_tr_data, type = 'response')
+trainpred.ecg.glm.death <- ifelse(pred_train_prob > 0.5,"Dead","Alive")
+trainerror.ecg.glm.death <- mean(trainpred.ecg.glm.death != death_tr_data$death)
+
+#Test error
+pred_test_prob <- predict(glmdeath,death_te_data, type = 'response')
+testpred.ecg.glm.death <- ifelse(pred_test_prob > 0.5, "Dead","Alive")
+testerror.ecg.glm.death <- mean(testpred.ecg.glm.death != death_te_data$death)
+```
+
+### ROC/AUC Logstic Model Death
+```{r}
+ecgpredroc.death<-roc(death_te_data$death,factor(testpred.ecg.glm.death,ordered=T))
+ecgpredauc.death<-auc(ecgpredroc.death)
+ecgpredroc.death
+ecgpredauc.death
+```
+## Final Error and AUC of Models
+```{r}
+model_title <- c("All Predictors Bagging", "All Predictors Random Forest",
+    "Random Forest with Economic Predictors",
+    "Logistic Regression with Economic Model", 
+    "Logistic Regression with ECG Predictors", 
+    "Classification Tree (CV = 50) with ECG Predictors", 
+    "All Predictors Classification Tree (CV = 50)", 
+    "Random Forest with ECG Predictors")
+complications_test_errors <- c(testerror.allpred.bag.target,testerror.all.rf.target,
+                               testerror.rfes.target,NA,NA, test_class_error3, 
+                               test_class_error5, testerror.rfes.ecgtarget_new)
+
+death_test_errors <- c(testerror.allpred.bag.death,testerror.all.rf.death,
+                       testerror.rfes.death,testerror.econ.glm.death,
+                       testerror.ecg.glm.death, test_class_error, test_class_error4, 
+                       testerror.rfes.ecgdeath)
+
+complications_aucs <- c(allpredbagauc.target,allpredrfauc.target,econpredauc.target,
+                        NA,NA, ecgpredcvauc.target_new, fullcvpredauc.target_new, 
+                        ecgrfpredauc.target_new)
+
+death_aucs <- c(allpredbagauc.death,allpredrfauc.death,econpredauc.death,econpredauc.death1,
+            ecgpredauc.death, ecgpredcvauc.death, fullcvpredauc.death, ecgrfpredauc.death)
+```
+
+### Print Final Table!
+```{r}
+comparingmodels<-data.frame(model_title,complications_test_errors,
+                      death_test_errors,complications_aucs,death_aucs)
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
+\newpage
+## Small tables
+### All Pred Target
+```{r}
+model_title <- c("All Predictors Bagging", "All Predictors Random Forest",
+    "All Predictors Classification Tree (CV = 50)")
+
+complications_test_errors <- c(testerror.allpred.bag.target,testerror.all.rf.target,test_class_error5)
+
+complications_aucs <- c(allpredbagauc.target,allpredrfauc.target,fullcvpredauc.target_new)
+
+comparingmodels<-data.frame(model_title,complications_test_errors,
+                            complications_aucs)
+
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
+\newpage
+
+### All Pred Death
+```{r}
+model_title <- c("All Predictors Bagging", "All Predictors Random Forest",
+                 "All Predictors Classification Tree (CV = 50)")
+
+death_test_errors <- c(testerror.allpred.bag.death,testerror.all.rf.death,test_class_error4)
+
+death_aucs <- c(allpredbagauc.death,allpredrfauc.death,fullcvpredauc.death)
+
+comparingmodels<-data.frame(model_title,death_test_errors,death_aucs)
+
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
+
+\newpage
+### ECG Target
+```{r}
+model_title <- c( 
+    "Classification Tree (CV = 50) with ECG Predictors", 
+    "Random Forest with ECG Predictors")
+complications_test_errors <- c(test_class_error3,testerror.rfes.ecgtarget_new)
+
+
+
+complications_aucs <- c(ecgpredcvauc.target_new, ecgrfpredauc.target_new)
+
+
+
+comparingmodels<-data.frame(model_title,complications_test_errors,
+                            complications_aucs)
+
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
+
+\newpage
+### ECG Death
+```{r}
+model_title <- c("Logistic Regression with ECG Predictors", 
+    "Classification Tree (CV = 50) with ECG Predictors", 
+    "Random Forest with ECG Predictors")
+
+
+death_test_errors <- c(testerror.ecg.glm.death, 
+                       test_class_error,
+                       testerror.rfes.ecgdeath)
+
+death_aucs <- c(ecgpredauc.death,ecgpredcvauc.death,ecgrfpredauc.death)
+
+comparingmodels<-data.frame(model_title,death_test_errors,death_aucs)
+
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
+
+\newpage
+### Econ Target
+```{r}
+model_title <- c("Random Forest with Economic Predictors")
+complications_test_errors <- c(testerror.rfes.target)
+
+#death_test_errors <- c(testerror.rfes.death)
+
+complications_aucs <- c(econpredauc.target)
+
+death_aucs <- c(econpredauc.death,econpredauc.death)
+
+comparingmodels<-data.frame(model_title,complications_test_errors,complications_aucs)
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
+
+\newpage
+### Econ Death
+```{r}
+model_title <- c("Random Forest with Economic Predictors",
+    "Logistic Regression with Economic Model")
+
+death_test_errors <- c(testerror.rfes.death,testerror.econ.glm.death)
+
+death_aucs <- c(econpredauc.death1,econpredauc.death)
+
+comparingmodels<-data.frame(model_title,death_test_errors,death_aucs)
+
+kable(comparingmodels,digits=3) |>
+  kable_styling(font_size = 8)
+```
